@@ -1,5 +1,17 @@
-body {
+html, body, #app {
+    width: 100%;
+    height: 100%;
     margin: 0;
+    padding: 0;
     overflow: hidden; /* Hide scrollbars */
     background-color: #000000; /* Ensure the body background is black/dark */
+}
+
+/* Make sure the WebGL canvas doesn't introduce scrollbars */
+canvas {
+    display: block;
+    position: fixed; /* ensure the canvas fills the viewport and isn't pushed by layout */
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
 }

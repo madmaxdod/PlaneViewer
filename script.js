@@ -11,6 +11,11 @@ scene.background = new THREE.Color(0x02001A); // Almost black, deep night sky bl
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
 
+// Make the canvas focusable so it can receive keyboard events in some preview environments.
+renderer.domElement.tabIndex = 0;
+renderer.domElement.style.outline = 'none';
+renderer.domElement.addEventListener('click', () => renderer.domElement.focus());
+
 const grid = new THREE.GridHelper(500, 50, 0x333333, 0x111111);
 scene.add(grid);
 
@@ -27,6 +32,87 @@ controls.dampingFactor = 0.05;
 controls.screenSpacePanning = false; // Makes panning more intuitive
 controls.maxPolarAngle = Math.PI * 0.9; // Prevents the user from flipping the camera completely upside down
 controls.minDistance = 10; // Prevent zooming too close to the origin
+
+// --- WASD Movement State ---
+const movement = {
+    forward: false,
+    backward: false,
+    left: false,
+    right: false,
+    up: false,
+    down: false,
+    speed: 60 // units per second (tweak for comfortable movement)
+};
+
+// Map keys to movement flags
+function onKeyDown(event) {
+    // Debug: show keydown events in the browser console
+    console.log('keydown', event.code);
+    switch (event.code) {
+        case 'KeyW': movement.forward = true; break;
+        case 'KeyS': movement.backward = true; break;
+        case 'KeyA': movement.left = true; break;
+        case 'KeyD': movement.right = true; break;
+        case 'KeyQ': movement.down = true; break; // descend
+        case 'KeyE': movement.up = true; break;   // ascend
+        case 'KeyF': toggleFullscreen(); break;   // F = fullscreen toggle
+    }
+}
+
+function onKeyUp(event) {
+    // Debug: show keyup events in the browser console
+    console.log('keyup', event.code);
+    switch (event.code) {
+        case 'KeyW': movement.forward = false; break;
+        case 'KeyS': movement.backward = false; break;
+        case 'KeyA': movement.left = false; break;
+        case 'KeyD': movement.right = false; break;
+        case 'KeyQ': movement.down = false; break;
+        case 'KeyE': movement.up = false; break;
+    }
+}
+
+window.addEventListener('keydown', onKeyDown);
+window.addEventListener('keyup', onKeyUp);
+
+// --- Fullscreen Toggle UI ---
+const fsButton = document.createElement('button');
+fsButton.textContent = '⛶ Fullscreen (F)';
+fsButton.title = 'Toggle fullscreen (F)';
+Object.assign(fsButton.style, {
+    position: 'absolute',
+    right: '12px',
+    top: '12px',
+    padding: '6px 10px',
+    background: 'rgba(255,255,255,0.06)',
+    color: '#fff',
+    border: '1px solid rgba(255,255,255,0.08)',
+    borderRadius: '4px',
+    cursor: 'pointer',
+    zIndex: 9999,
+    backdropFilter: 'blur(4px)'
+});
+fsButton.addEventListener('click', toggleFullscreen);
+document.body.appendChild(fsButton);
+
+function updateFsButton() {
+    if (document.fullscreenElement) fsButton.textContent = '⤫ Exit Fullscreen (F)';
+    else fsButton.textContent = '⛶ Fullscreen (F)';
+}
+
+document.addEventListener('fullscreenchange', updateFsButton);
+
+async function toggleFullscreen() {
+    try {
+        if (!document.fullscreenElement) {
+            await document.documentElement.requestFullscreen();
+        } else {
+            await document.exitFullscreen();
+        }
+    } catch (err) {
+        console.warn('Fullscreen toggle failed:', err);
+    }
+}
 
 // Add a subtle ambient light for overall scene visibility
 const ambientLight = new THREE.AmbientLight(0x404040, 5); // soft white light
@@ -133,17 +219,52 @@ for (let i = 0; i < MAX_PLANES; i++) {
 }
 
 // --- Animation Loop ---
+let _prevTime = null;
 function animate(time) {
     requestAnimationFrame(animate);
-    const dt = 1 / 60; // Assuming 60fps for simple physics/timing
-  
-    // IMPORTANT: Update the controls in the animation loop
+
+    // time is in milliseconds from requestAnimationFrame
+    if (_prevTime === null) _prevTime = time;
+    const dt = Math.max(0.0001, (time - _prevTime) / 1000); // seconds since last frame
+    _prevTime = time;
+
+    // --- Camera WASD movement (move both camera and controls.target) ---
+    const moveSpeed = movement.speed * dt; // units per frame based on speed (units/sec)
+    const moveOffset = new THREE.Vector3();
+    if (movement.forward || movement.backward || movement.left || movement.right || movement.up || movement.down) {
+        // Forward vector (ignore vertical component for forward/back strafing)
+        const forward = new THREE.Vector3();
+        camera.getWorldDirection(forward);
+        forward.y = 0;
+        forward.normalize();
+
+        // Right vector
+        const right = new THREE.Vector3();
+        right.crossVectors(forward, camera.up).normalize();
+
+        if (movement.forward) moveOffset.add(forward);
+        if (movement.backward) moveOffset.sub(forward);
+        if (movement.left) moveOffset.sub(right);
+        if (movement.right) moveOffset.add(right);
+        if (movement.up) moveOffset.y += 1;
+        if (movement.down) moveOffset.y -= 1;
+
+        if (moveOffset.lengthSq() > 0) {
+            moveOffset.normalize().multiplyScalar(moveSpeed);
+            camera.position.add(moveOffset);
+            controls.target.add(moveOffset);
+        }
+    }
+
+    // Update controls (damping, etc.) after moving camera/target
     controls.update();
 
     planes.forEach(plane => {
         // 1. Movement
-        // Move the plane in its forward direction (Z-axis local space)
-        plane.mesh.translateZ(plane.speed);
+        // Move the plane in its forward direction (Z-axis local space). The original code
+        // used a per-frame speed; convert to frame-corrected movement by scaling with dt*60
+        const frameFactor = dt * 60;
+        plane.mesh.translateZ(plane.speed * frameFactor);
 
         // 2. Wrap-around functionality (reposition if too far)
         if (plane.mesh.position.x > 300 || plane.mesh.position.x < -300 ||
