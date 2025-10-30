@@ -4,8 +4,19 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import './style.css';
 
-// Debug flag to make plane lights extremely visible while debugging
+// Debug flags
 const DEBUG_LIGHTS = false;
+const DEBUG_HUD = false; // Show on-screen debug info for nearest plane
+const DEBUG_CONSOLE = false; // Log spawn/altitude events to console
+// Global plane speed multiplier (set >1 to speed up planes for debugging)
+
+// Loading screen management
+let planesLoaded = 0;
+const loadingScreen = document.getElementById('loading-screen');
+const loadingText = document.querySelector('.loading-text');
+const DEBUG_PLANE_SPEED_MULT = 3; // e.g., 8x faster; set to 1 for normal
+// Camera movement speed multiplier for debug mode
+const DEBUG_CAMERA_SPEED_MULT = 4; // 4x faster camera in debug mode; set to 1 for normal
 
 // --- Global Setup ---
 const scene = new THREE.Scene();
@@ -18,54 +29,80 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 
-// Set a very dark background
-scene.background = new THREE.Color(0x02001A); // Almost black, deep night sky blue
+// Day/Night Cycle Configuration
+let timeOfDay = 0.25; // 0 = midnight, 0.25 = sunrise, 0.5 = noon, 0.75 = sunset, 1.0 = midnight
+const DAY_CYCLE_SPEED = 0.001; // How fast time progresses (0.01 = ~100 seconds per full cycle)
+
+// Atmospheric Haze/Fog Configuration
+const FOG_NEAR = 500;  // Distance where fog starts to appear
+const FOG_FAR = 1200;   // Distance where fog is at maximum density (before spawn area)
+
+// Wind System Configuration
+let windDirection = Math.random() * Math.PI * 2; // Global wind direction (radians)
+let windStrength = 0.5 + Math.random() * 1.5; // Wind strength (0.5-2.0)
+let windChangeTimer = 0;
+const WIND_CHANGE_INTERVAL = 60; // Change wind every 60 seconds
+const TURBULENCE_FREQUENCY = 0.3; // How often turbulence affects each plane
+
+// Set initial background (will be updated by day/night cycle)
+scene.background = new THREE.Color(0x02001A);
+// Initialize fog (color will be updated with day/night cycle)
+scene.fog = new THREE.Fog(0x02001A, FOG_NEAR, FOG_FAR);
 renderer.setSize(window.innerWidth, window.innerHeight);
 // Attach canvas to the #app container if present to avoid layout/CSS conflicts
 const appRoot = document.getElementById('app');
 (appRoot || document.body).appendChild(renderer.domElement);
 
-// Create a green "grass" ground to replace the default gray grid
+// Create a green "grass" ground using chunked tiles so terrain streams as you move.
 // We'll generate a small canvas texture with a green gradient and subtle blade strokes,
-// then tile it over a large plane.
-const planeSize = 2000;
-// Ground height (where the grid lies)
+// then tile it over chunk meshes that load/unload around the camera.
+const CHUNK_SIZE = 2000;     // world tile size in units (X/Z) - larger to extend beyond fog
+const CHUNK_RADIUS = 1;      // how many tiles around the current to keep loaded (1 => 3x3 grid = 6km coverage)
+// Ground height (where the grid lies) - this is the REFERENCE POINT (Y=0 in world space)
 const GROUND_HEIGHT = 0;
 
-// --- Altitude Limits (EDIT THESE TO ADJUST FLIGHT FLOOR AND CEILING) ---
-const MIN_HEIGHT = 15;   // Minimum altitude floor (units above ground)
-const MAX_HEIGHT = 300;  // Maximum altitude ceiling (units above ground)
-const FLOOR_BUFFER = 40;                 // Start cushioning this many units above MIN_HEIGHT (was 20)
-const SPAWN_FLOOR_MIN_OFFSET = 30;       // Absolute minimum spawn/respawn height above MIN_HEIGHT (was 10)
-const NEAR_FLOOR_SPEED_BIAS_OFFSET = 60; // If within this of MIN_HEIGHT, bias vSpeed upward (was 30)
-const FLOOR_CLAMP_OFFSET = 20;           // Hard clamp floor at MIN_HEIGHT + this offset (was 10)
+// --- Altitude Limits: ALL VALUES ARE HEIGHT ABOVE GROUND (AGL) ---
+// To get absolute Y position, add GROUND_HEIGHT (which is 0, so AGL = absolute Y)
+const MIN_HEIGHT_AGL = 50;   // Reference floor (meters AGL)
+const MAX_HEIGHT_AGL = 800;  // Reference ceiling (meters AGL) - very high to give lots of room
+const FLOOR_AVOIDANCE_DIST = 150;  // Wide danger zone - start pushing up when within this distance of floor
+const CEILING_AVOIDANCE_DIST = 150; // Wide danger zone - start pushing down when within this distance of ceiling
 
-// --- Spawn altitude band (keeps planes comfortably away from floor buffer and ceiling) ---
-const SPAWN_MIN_FROM_BUFFER = 20;        // Additional distance above the start of cushioning
-const SPAWN_CEILING_MARGIN = 35;         // Keep spawns below ceiling by this margin
+// Helper to convert AGL to absolute Y (though since GROUND_HEIGHT=0, they're the same)
+const aglToY = (agl) => GROUND_HEIGHT + agl;
+const yToAGL = (y) => y - GROUND_HEIGHT;
 
-// Compute a safe spawn altitude given the plane's cruise band
-function computeSpawnAltitude(minCruise, altitudeCeiling) {
-    // Start at least this far above MIN_HEIGHT so planes have room to wander
-    const minAlt = Math.max(
-        MIN_HEIGHT + FLOOR_BUFFER + SPAWN_MIN_FROM_BUFFER,
-        MIN_HEIGHT + SPAWN_FLOOR_MIN_OFFSET,
-        minCruise * 0.95
+// Define safe zone for all operations (well away from floor/ceiling limits)
+const SAFE_ZONE_MIN = MIN_HEIGHT_AGL + FLOOR_AVOIDANCE_DIST + 50; // 250m (50 + 150 + 50)
+const SAFE_ZONE_MAX = MAX_HEIGHT_AGL - CEILING_AVOIDANCE_DIST - 50; // 600m (800 - 150 - 50)
+
+// Compute a safe spawn altitude (always in safe zone)
+function computeSpawnAltitude() {
+    const altitude = SAFE_ZONE_MIN + Math.random() * (SAFE_ZONE_MAX - SAFE_ZONE_MIN);
+    return aglToY(altitude); // Convert to absolute Y position (170-240m)
+}
+
+// --- Waypoint System ---
+const WAYPOINT_DISTANCE_MIN = 800;  // Minimum distance from plane to waypoint
+const WAYPOINT_DISTANCE_MAX = 1500; // Maximum distance from plane to waypoint
+
+// Generate a waypoint far from the plane's current position
+function generateWaypoint(planePos) {
+    const distance = WAYPOINT_DISTANCE_MIN + Math.random() * (WAYPOINT_DISTANCE_MAX - WAYPOINT_DISTANCE_MIN);
+    const angle = Math.random() * Math.PI * 2; // Random horizontal direction
+    const altitude = SAFE_ZONE_MIN + Math.random() * (SAFE_ZONE_MAX - SAFE_ZONE_MIN);
+    
+    return new THREE.Vector3(
+        planePos.x + Math.cos(angle) * distance,
+        aglToY(altitude),
+        planePos.z + Math.sin(angle) * distance
     );
-    const maxAlt = Math.max(minAlt + 5, altitudeCeiling - SPAWN_CEILING_MARGIN);
-    // Choose uniformly within [minAlt, maxAlt]
-    const alt = THREE.MathUtils.clamp(
-        minAlt + Math.random() * (maxAlt - minAlt),
-        MIN_HEIGHT + SPAWN_FLOOR_MIN_OFFSET,
-        altitudeCeiling - SPAWN_CEILING_MARGIN
-    );
-    return alt;
 }
 
 // Spawn/despawn bounding boxes (sizes)
-const SPAWN_BOX_SIZE = 600; // small box around camera where planes spawn frequently
-const DESPAWN_BOX_SIZE = planeSize; // beyond this box planes will be respawned
-const SPAWN_NEAR_PROB = 0.8; // probability a respawn will be near the camera
+const DESPAWN_BOX_SIZE = CHUNK_SIZE * 3; // beyond this box planes will be respawned (3000m)
+const SPAWN_DISTANCE_MIN = 1200; // minimum distance from viewer to spawn (well beyond fog)
+const SPAWN_DISTANCE_MAX = 1800; // maximum distance from viewer to spawn
 
 const grassCanvas = document.createElement('canvas');
 grassCanvas.width = 1024;
@@ -166,7 +203,7 @@ gctx.globalAlpha = 1.0;
 const grassTexture = new THREE.CanvasTexture(grassCanvas);
 grassTexture.wrapS = THREE.RepeatWrapping;
 grassTexture.wrapT = THREE.RepeatWrapping;
-grassTexture.repeat.set(planeSize / 64, planeSize / 64);
+grassTexture.repeat.set(CHUNK_SIZE / 64, CHUNK_SIZE / 64);
 
 const groundMat = new THREE.MeshStandardMaterial({ 
     map: grassTexture,
@@ -174,11 +211,62 @@ const groundMat = new THREE.MeshStandardMaterial({
     metalness: 0.0,
     side: THREE.DoubleSide
 });
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(planeSize, planeSize), groundMat);
-ground.rotation.x = -Math.PI / 2;
-ground.position.y = GROUND_HEIGHT - 0.01; // slightly below grid line to avoid z-fighting
-ground.receiveShadow = true;
-scene.add(ground);
+// --- Terrain Chunk Manager ---
+class TerrainChunkManager {
+    constructor(scene, material) {
+        this.scene = scene;
+        this.material = material;
+        // Share a single geometry across all tiles for perf
+        this.geometry = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE);
+        this.active = new Map(); // key -> mesh
+        this.centerCx = null;
+        this.centerCz = null;
+    }
+
+    key(cx, cz) { return `${cx},${cz}`; }
+
+    ensureChunk(cx, cz) {
+        const k = this.key(cx, cz);
+        if (this.active.has(k)) return;
+        const mesh = new THREE.Mesh(this.geometry, this.material);
+        mesh.rotation.x = -Math.PI / 2;
+        mesh.position.set(cx * CHUNK_SIZE, GROUND_HEIGHT - 0.01, cz * CHUNK_SIZE);
+        mesh.receiveShadow = true;
+        this.scene.add(mesh);
+        this.active.set(k, mesh);
+    }
+
+    update(centerPos) {
+        const cx = Math.floor(centerPos.x / CHUNK_SIZE);
+        const cz = Math.floor(centerPos.z / CHUNK_SIZE);
+        if (cx === this.centerCx && cz === this.centerCz && this.active.size > 0) return; // no tile crossing
+        this.centerCx = cx; this.centerCz = cz;
+
+        // Desired set of chunks
+        const needed = new Set();
+        for (let dz = -CHUNK_RADIUS; dz <= CHUNK_RADIUS; dz++) {
+            for (let dx = -CHUNK_RADIUS; dx <= CHUNK_RADIUS; dx++) {
+                const x = cx + dx;
+                const z = cz + dz;
+                const k = this.key(x, z);
+                needed.add(k);
+                this.ensureChunk(x, z);
+            }
+        }
+
+        // Remove chunks that are no longer needed (behind you)
+        for (const [k, mesh] of this.active) {
+            if (!needed.has(k)) {
+                this.scene.remove(mesh);
+                mesh.geometry = null; // geometry is shared - don't dispose here
+                // keep material shared; do not dispose
+                this.active.delete(k);
+            }
+        }
+    }
+}
+
+const terrainChunks = new TerrainChunkManager(scene, groundMat);
 
 
 
@@ -194,7 +282,9 @@ const skyMaterial = new THREE.ShaderMaterial({
     transparent: true,
     depthWrite: false,
     uniforms: {
-        groundHeight: { value: GROUND_HEIGHT }
+        groundHeight: { value: GROUND_HEIGHT },
+        timeOfDay: { value: timeOfDay },
+        sunDirection: { value: new THREE.Vector3(0, 1, 0) }
     },
     vertexShader: `
         varying vec3 vWorldPos;
@@ -207,13 +297,48 @@ const skyMaterial = new THREE.ShaderMaterial({
     fragmentShader: `
         varying vec3 vWorldPos;
         uniform float groundHeight;
+        uniform float timeOfDay;
+        uniform vec3 sunDirection;
+        
         void main() {
             // Smooth step to blend the sky in above the ground
             float h = smoothstep(groundHeight, groundHeight + 40.0, vWorldPos.y);
-            // Sky color gradient from deep night to a slightly lighter horizon
-            vec3 topColor = vec3(0.01, 0.03, 0.12);
-            vec3 horizonColor = vec3(0.02, 0.06, 0.18);
-            vec3 color = mix(horizonColor, topColor, clamp((vWorldPos.y - groundHeight) / 400.0, 0.0, 1.0));
+            
+            // Calculate sun influence for sky colors
+            vec3 viewDir = normalize(vWorldPos);
+            float sunDot = dot(viewDir, sunDirection);
+            float sunInfluence = smoothstep(-0.1, 0.3, sunDot);
+            
+            // Define sky colors for different times of day
+            vec3 nightTopColor = vec3(0.01, 0.03, 0.12);
+            vec3 nightHorizonColor = vec3(0.02, 0.06, 0.18);
+            
+            vec3 dayTopColor = vec3(0.3, 0.5, 0.9);
+            vec3 dayHorizonColor = vec3(0.6, 0.7, 0.9);
+            
+            vec3 sunsetTopColor = vec3(0.2, 0.3, 0.6);
+            vec3 sunsetHorizonColor = vec3(1.0, 0.5, 0.3);
+            
+            // Determine day phase (0 = night, 0.5 = sunrise/sunset, 1 = day)
+            float dayPhase = smoothstep(0.15, 0.35, timeOfDay) - smoothstep(0.65, 0.85, timeOfDay);
+            
+            // Determine sunset phase
+            float sunsetPhase = smoothstep(0.1, 0.25, timeOfDay) * (1.0 - smoothstep(0.25, 0.35, timeOfDay))
+                              + smoothstep(0.65, 0.75, timeOfDay) * (1.0 - smoothstep(0.75, 0.9, timeOfDay));
+            
+            // Mix colors based on time of day
+            vec3 topColor = mix(nightTopColor, dayTopColor, dayPhase);
+            topColor = mix(topColor, sunsetTopColor, sunsetPhase);
+            
+            vec3 horizonColor = mix(nightHorizonColor, dayHorizonColor, dayPhase);
+            horizonColor = mix(horizonColor, sunsetHorizonColor, sunsetPhase);
+            
+            // Add sun glow at horizon
+            horizonColor += vec3(1.0, 0.8, 0.5) * sunInfluence * dayPhase * 0.5;
+            
+            // Gradient from horizon to top
+            float gradientFactor = clamp((vWorldPos.y - groundHeight) / 400.0, 0.0, 1.0);
+            vec3 color = mix(horizonColor, topColor, gradientFactor);
 
             // If we're below the small fade region, discard to show ground/objects instead
             if (h < 0.01) discard;
@@ -231,10 +356,17 @@ scene.add(skyMesh);
 camera.far = Math.max(camera.far, SKY_RADIUS * 1.5);
 camera.updateProjectionMatrix();
 
-// --- Stars and Moon ---
-// We'll create a skyObjects group that follows the camera so stars/moon appear infinitely far.
+// --- Celestial Objects (Sun, Moon, Stars) ---
 const skyObjects = new THREE.Group();
 scene.add(skyObjects);
+
+const celestialObjects = {
+    stars: [],
+    moon: null,
+    moonLight: null,
+    sun: null,
+    sunLight: null
+};
 
 function createStars(count = 200) {
     const starGeo = new THREE.SphereGeometry(0.6, 8, 8);
@@ -249,41 +381,54 @@ function createStars(count = 200) {
         const z = r * Math.sin(theta) * Math.sin(phi);
 
         const color = Math.random() > 0.85 ? 0xfff2b3 : 0xffffff; // some warm stars
-    const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
-    // Render stars on top of scene geometry so they're always visible
-    mat.depthTest = false;
+        const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
+        // Render stars on top of scene geometry so they're always visible
+        mat.depthTest = false;
         const star = new THREE.Mesh(starGeo, mat);
         star.position.set(x, y, z);
-    const scale = 0.6 + Math.random() * 1.6;
-    star.scale.setScalar(scale);
-    star.renderOrder = 1000;
-    skyObjects.add(star);
+        const scale = 0.6 + Math.random() * 1.6;
+        star.scale.setScalar(scale);
+        star.renderOrder = 1000;
+        skyObjects.add(star);
+        celestialObjects.stars.push(star);
     }
 }
 
 function createMoon() {
     const moonRadius = 50;
     const moonGeo = new THREE.SphereGeometry(moonRadius, 32, 16);
-    const moonMat = new THREE.MeshStandardMaterial({ color: 0xf6f3e1, emissive: 0xffffee, emissiveIntensity: 1.2, roughness: 0.8 });
-    // ensure moon is always visible (rendered on top)
+    const moonMat = new THREE.MeshBasicMaterial({ color: 0xf6f3e1, transparent: true });
     moonMat.depthTest = false;
     const moon = new THREE.Mesh(moonGeo, moonMat);
-    // place moon in the sky (somewhere above and to the side) but within camera.far
-    const dir = new THREE.Vector3(-0.4, 0.8, -1).normalize();
-    const moonDist = Math.min(SKY_RADIUS - 80, camera.far * 0.9);
-    moon.position.copy(dir.clone().multiplyScalar(moonDist));
+    moon.renderOrder = 1000;
     skyObjects.add(moon);
+    celestialObjects.moon = moon;
 
     // add a gentle point light for the moon
-    const moonLight = new THREE.PointLight(0xffffff, 1.6, camera.far * 0.9, 1);
-    moonLight.position.copy(moon.position);
-    skyObjects.add(moonLight);
-    // render moon on top
-    moon.renderOrder = 1000;
+    const moonLight = new THREE.DirectionalLight(0xaaccff, 0.3);
+    scene.add(moonLight);
+    celestialObjects.moonLight = moonLight;
+}
+
+function createSun() {
+    const sunRadius = 60;
+    const sunGeo = new THREE.SphereGeometry(sunRadius, 32, 16);
+    const sunMat = new THREE.MeshBasicMaterial({ color: 0xffee88, transparent: true });
+    sunMat.depthTest = false;
+    const sun = new THREE.Mesh(sunGeo, sunMat);
+    sun.renderOrder = 1000;
+    skyObjects.add(sun);
+    celestialObjects.sun = sun;
+
+    // add a directional light for the sun
+    const sunLight = new THREE.DirectionalLight(0xffffee, 1.5);
+    scene.add(sunLight);
+    celestialObjects.sunLight = sunLight;
 }
 
 createStars(240);
 createMoon();
+createSun();
 
 // (camera position set after parenting below)
 
@@ -293,12 +438,18 @@ createMoon();
 // on pointer movement's X axis only. The camera's local rotation/pitch/roll will be
 // kept at zero so there's no pitch or roll.
 const yawObject = new THREE.Object3D();
-yawObject.position.set(0, 0, 0);
+// Start at the center of a chunk (CHUNK_SIZE / 2)
+yawObject.position.set(CHUNK_SIZE / 2, 0, CHUNK_SIZE / 2);
 // pitchObject will handle up/down rotation; camera remains child of pitchObject
 const pitchObject = new THREE.Object3D();
 pitchObject.add(camera);
 yawObject.add(pitchObject);
 scene.add(yawObject);
+
+// Initialize terrain chunks around the starting position
+if (typeof terrainChunks !== 'undefined') {
+    terrainChunks.update(yawObject.position);
+}
 
 let isLocked = false;
 
@@ -336,7 +487,7 @@ const movement = {
     right: false,
     up: false,
     down: false,
-    speed: 80 // units per second (ground movement speed)
+    speed: 20 // units per second (normal ground movement speed - slower for realism)
 };
 
 // Map keys to movement flags
@@ -387,6 +538,30 @@ Object.assign(fsButton.style, {
 });
 fsButton.addEventListener('click', toggleFullscreen);
 document.body.appendChild(fsButton);
+
+// --- Debug HUD ---
+let debugHUD = null;
+if (DEBUG_HUD) {
+    debugHUD = document.createElement('div');
+    Object.assign(debugHUD.style, {
+        position: 'absolute',
+        left: '12px',
+        top: '80px',
+        padding: '10px 14px',
+        background: 'rgba(0,0,0,0.75)',
+        color: '#0f0',
+        border: '1px solid rgba(0,255,0,0.3)',
+        borderRadius: '4px',
+        fontFamily: 'monospace',
+        fontSize: '11px',
+        lineHeight: '1.5',
+        zIndex: '9998',
+        minWidth: '280px',
+        backdropFilter: 'blur(4px)'
+    });
+    debugHUD.innerHTML = 'Debug: Initializing...';
+    document.body.appendChild(debugHUD);
+}
 
 function updateFsButton() {
     if (document.fullscreenElement) fsButton.textContent = '⤫ Exit Fullscreen (F)';
@@ -464,7 +639,7 @@ const BASE_GREEN_LIGHT_POSITION = new THREE.Vector3(0.5, 0, -1);
 const BASE_WHITE_LIGHT_POSITIONS = [
     new THREE.Vector3(-0.5, 0, -1),
     new THREE.Vector3(0.5, 0, -1),
-    new THREE.Vector3(0, 0, 1.5)
+    new THREE.Vector3(0, 0, -3)
 ];
 
 // Derive reasonable navigation light offsets based on model bounding box
@@ -639,31 +814,36 @@ async function createPlaneGeometry() {
 
 // Function to create a plane object with all components
 async function createPlanePlaceholder(spawnNear = true, center = null) {
-    // Create the main plane geometry/model (await the async loading)
-    const planeMesh = await createPlaneGeometry();
-    const lightOffsets = planeMesh.userData && planeMesh.userData.lightOffsets;
+    try {
+        // Create the main plane geometry/model (await the async loading)
+        const planeMesh = await createPlaneGeometry();
+        if (!planeMesh) {
+            throw new Error('createPlaneGeometry returned null/undefined');
+        }
+        const lightOffsets = planeMesh.userData && planeMesh.userData.lightOffsets;
 
     // Per-plane performance characteristics for varied behavior
     const baseSpeedFactor = 0.75 + Math.random() * 0.6;
-    const baseMinCruiseAltitude = Math.min(MAX_HEIGHT - 40, MIN_HEIGHT + 30 + Math.random() * 90);
     const climbPerformance = 0.8 + Math.random() * 0.6;
     const baseMaxClimbRate = 0.9 + Math.random() * 0.7;
     const baseMaxDescentRate = 0.4 + Math.random() * 0.5;
+    
+    // Spawn with level or slight climb to avoid immediate nosedive
     const initialVSpeed = THREE.MathUtils.clamp(
-        (Math.random() - 0.5) * (baseMaxClimbRate + baseMaxDescentRate),
-        -baseMaxDescentRate,
+        Math.random() * baseMaxClimbRate * 0.5, // 0 to 50% of max climb (never negative at spawn)
+        0,
         baseMaxClimbRate
     );
-    const baseAltitudeCeiling = Math.min(
-        MAX_HEIGHT - 20,
-        baseMinCruiseAltitude + 120 + Math.random() * 120
-    );
-    let targetAltitude = THREE.MathUtils.clamp(
-        baseMinCruiseAltitude + Math.random() * (baseAltitudeCeiling - baseMinCruiseAltitude),
-        MIN_HEIGHT + 40,
-        baseAltitudeCeiling
-    );
-    const initialAltitudeInterval = 15 + Math.random() * 20;
+    
+    const initialWaypointInterval = 30 + Math.random() * 40; // Time before first waypoint change (30-70s)
+    
+    if (DEBUG_CONSOLE) {
+        console.log('🛫 Creating plane:', {
+            initialVSpeed: initialVSpeed.toFixed(2),
+            maxClimb: baseMaxClimbRate.toFixed(2),
+            maxDescent: baseMaxDescentRate.toFixed(2)
+        });
+    }
 
     // --- Navigation Lights ---
     // Red Light (e.g., left wing)
@@ -749,14 +929,12 @@ async function createPlanePlaceholder(spawnNear = true, center = null) {
         mesh: planeMesh,
         speed: 10,
         baseSpeed: baseSpeedFactor,
-    minCruiseAltitude: baseMinCruiseAltitude,
         climbPerformance,
-    maxClimbRate: baseMaxClimbRate,
-    maxDescentRate: baseMaxDescentRate,
-    altitudeCeiling: baseAltitudeCeiling,
-    targetAltitude,
-    altitudeTimer: 0,
-    altitudeInterval: initialAltitudeInterval,
+        maxClimbRate: baseMaxClimbRate,
+        maxDescentRate: baseMaxDescentRate,
+        waypoint: null, // Will be set after position is determined
+        waypointTimer: 0,
+        waypointInterval: initialWaypointInterval,
         baseScale: planeMesh.scale.clone(),
         redLight: redLight,
         greenLight: greenLight,
@@ -780,158 +958,101 @@ async function createPlanePlaceholder(spawnNear = true, center = null) {
         turnRate: (Math.random() - 0.5) * 0.4,  // degrees/sec for steering (slower, more purposeful)
         targetHeading: Math.random() * Math.PI * 2, // random target heading for flight path
         headingChangeTimer: 0,
-    headingChangeInterval: 45 + Math.random() * 55  // change heading every 45-100 seconds
+        headingChangeInterval: 45 + Math.random() * 55,  // change heading every 45-100 seconds
+        
+        // Wind effects
+        turbulenceTimer: Math.random() * 10, // Random start for turbulence
+        turbulenceOffset: new THREE.Vector3(0, 0, 0), // Current turbulence displacement
+        windDrift: new THREE.Vector3(0, 0, 0) // Accumulated wind drift
     };
 
     // Determine spawn center (camera world pos by default)
     const spawnCenter = center || (function(){ const p=new THREE.Vector3(); camera.getWorldPosition(p); return p; })();
 
-    // Random initial position: spawn on the border of the chosen box (near or far)
-    function pointOnBorder(center, size) {
-        const half = size / 2;
-        const side = Math.floor(Math.random() * 4);
-        let x = center.x;
-        let z = center.z;
-        const rand = (Math.random() - 0.5) * size;
-        switch (side) {
-            case 0: // left
-                x = center.x - half;
-                z = center.z + rand;
-                break;
-            case 1: // right
-                x = center.x + half;
-                z = center.z + rand;
-                break;
-            case 2: // bottom
-                x = center.x + rand;
-                z = center.z - half;
-                break;
-            case 3: // top
-                x = center.x + rand;
-                z = center.z + half;
-                break;
-        }
-        return { x, z };
-    }
-
-    if (spawnNear) {
-        const p = pointOnBorder(spawnCenter, SPAWN_BOX_SIZE);
-        planeMesh.position.x = p.x;
-        planeMesh.position.z = p.z;
-    } else {
-        const p = pointOnBorder(spawnCenter, DESPAWN_BOX_SIZE);
-        planeMesh.position.x = p.x;
-        planeMesh.position.z = p.z;
-    }
-    const minCruise = plane.minCruiseAltitude || Math.min(MAX_HEIGHT - 40, MIN_HEIGHT + 30 + Math.random() * 90);
-    plane.minCruiseAltitude = minCruise;
-    const effectiveAltitudeCeiling = plane.altitudeCeiling || Math.min(MAX_HEIGHT - 20, minCruise + 120 + Math.random() * 120);
-    plane.altitudeCeiling = effectiveAltitudeCeiling;
-    // Spawn altitude: choose within a safe band far above the buffer and below the ceiling
-    const respawnAltitude = computeSpawnAltitude(minCruise, effectiveAltitudeCeiling);
-    plane.mesh.position.y = respawnAltitude;
+    // Spawn at a random distance away from viewer (not on visible borders)
+    const spawnDistance = SPAWN_DISTANCE_MIN + Math.random() * (SPAWN_DISTANCE_MAX - SPAWN_DISTANCE_MIN);
+    const spawnAngle = Math.random() * Math.PI * 2; // random direction
     
-    const spawnMaxClimb = plane.maxClimbRate || 1.2;
-    const spawnMaxDescent = plane.maxDescentRate || 0.8;
-    plane.vSpeed = THREE.MathUtils.clamp(
-        (Math.random() - 0.5) * (spawnMaxClimb + spawnMaxDescent),
-        -spawnMaxDescent,
-        spawnMaxClimb
-    );
-    plane.desiredClimbSmooth = plane.vSpeed;
-    // If we spawned close to the floor, bias vertical speed upward to avoid immediate descent
-    if (plane.mesh.position.y < MIN_HEIGHT + NEAR_FLOOR_SPEED_BIAS_OFFSET) {
-        plane.vSpeed = Math.max(plane.vSpeed, spawnMaxClimb * 0.6);
-        plane.desiredClimbSmooth = plane.vSpeed;
-    }
-    plane.altitudeTimer = 0;
-    plane.altitudeInterval = 15 + Math.random() * 20;
-    plane.targetAltitude = THREE.MathUtils.clamp(
-        minCruise + Math.random() * (plane.altitudeCeiling - minCruise),
-        MIN_HEIGHT + 40,
-        plane.altitudeCeiling
-    );
+    planeMesh.position.x = spawnCenter.x + Math.cos(spawnAngle) * spawnDistance;
+    planeMesh.position.z = spawnCenter.z + Math.sin(spawnAngle) * spawnDistance;
+    
+    // Set spawn altitude using simplified function
+    plane.mesh.position.y = computeSpawnAltitude();
+    
+    // Set initial vSpeed (already set above in plane creation)
+    plane.vSpeed = initialVSpeed;
+    plane.desiredClimbSmooth = initialVSpeed;
+    
+    // Generate initial waypoint after position is set
+    plane.waypoint = generateWaypoint(planeMesh.position);
+    
     updatePlaneProperties(plane);
 
     scene.add(planeMesh);
     planes.push(plane);
+    } catch (error) {
+        console.error('❌ Error in createPlanePlaceholder:', error);
+        throw error; // Re-throw to be caught by caller
+    }
 }
 
 function respawnPlane(plane, center = null) {
     const spawnCenter = center || (function(){ const p=new THREE.Vector3(); camera.getWorldPosition(p); return p; })();
-    const spawnNear = Math.random() < SPAWN_NEAR_PROB;
-    function pointOnBorder(center, size) {
-        const half = size / 2;
-        const side = Math.floor(Math.random() * 4);
-        let x = center.x;
-        let z = center.z;
-        const rand = (Math.random() - 0.5) * size;
-        switch (side) {
-            case 0:
-                x = center.x - half;
-                z = center.z + rand;
-                break;
-            case 1:
-                x = center.x + half;
-                z = center.z + rand;
-                break;
-            case 2:
-                x = center.x + rand;
-                z = center.z - half;
-                break;
-            case 3:
-                x = center.x + rand;
-                z = center.z + half;
-                break;
-        }
-        return { x, z };
-    }
-    if (spawnNear) {
-        const p = pointOnBorder(spawnCenter, SPAWN_BOX_SIZE);
-        plane.mesh.position.x = p.x;
-        plane.mesh.position.z = p.z;
-    } else {
-        const p = pointOnBorder(spawnCenter, DESPAWN_BOX_SIZE);
-        plane.mesh.position.x = p.x;
-        plane.mesh.position.z = p.z;
-    }
-    const respawnAltitude2 = computeSpawnAltitude(
-        plane.minCruiseAltitude || Math.min(MAX_HEIGHT - 40, MIN_HEIGHT + 60),
-        plane.altitudeCeiling || Math.min(MAX_HEIGHT - 20, (plane.minCruiseAltitude || (MIN_HEIGHT + 60)) + 160)
-    );
-    plane.mesh.position.y = Math.min(respawnAltitude2, MAX_HEIGHT);
+    
+    // Spawn at a random distance away from viewer (not on visible borders)
+    const spawnDistance = SPAWN_DISTANCE_MIN + Math.random() * (SPAWN_DISTANCE_MAX - SPAWN_DISTANCE_MIN);
+    const spawnAngle = Math.random() * Math.PI * 2; // random direction
+    
+    plane.mesh.position.x = spawnCenter.x + Math.cos(spawnAngle) * spawnDistance;
+    plane.mesh.position.z = spawnCenter.z + Math.sin(spawnAngle) * spawnDistance;
+    
+    // Respawn at safe altitude
+    plane.mesh.position.y = computeSpawnAltitude();
     plane.mesh.rotation.y = Math.random() * Math.PI * 2;
+    
     const maxClimbRate = plane.maxClimbRate || 1.2;
     const maxDescentRate = plane.maxDescentRate || 0.8;
-    const randomVSpeed = THREE.MathUtils.lerp(-maxDescentRate, maxClimbRate, Math.random());
+    
+    // Respawn with level or slight climb to avoid nosedive
+    const randomVSpeed = THREE.MathUtils.clamp(
+        Math.random() * maxClimbRate * 0.5, // 0 to 50% of max climb
+        0,
+        maxClimbRate
+    );
     plane.vSpeed = randomVSpeed;
     plane.desiredClimbSmooth = plane.vSpeed;
-    // If we respawned close to the floor, force a climb to ensure recovery
-    if (plane.mesh.position.y < MIN_HEIGHT + NEAR_FLOOR_SPEED_BIAS_OFFSET) {
-        plane.vSpeed = Math.max(plane.vSpeed, maxClimbRate * 0.6);
-        plane.desiredClimbSmooth = plane.vSpeed;
-    }
     plane.lightTimer = Math.random() * 50;
+    
+    // Generate new waypoint for respawned plane
+    plane.waypoint = generateWaypoint(plane.mesh.position);
+    
+    if (DEBUG_CONSOLE) {
+        console.log('🔄 Respawning plane at:', {
+            altitude: plane.mesh.position.y.toFixed(1),
+            vSpeed: plane.vSpeed.toFixed(2),
+            waypoint: `(${plane.waypoint.x.toFixed(0)}, ${plane.waypoint.y.toFixed(0)}, ${plane.waypoint.z.toFixed(0)})`
+        });
+    }
     
     // Reset physics on respawn
     plane.heading = plane.mesh.rotation.y;
     plane.pitch = 0; // start level on respawn; physics will introduce attitude gradually
     plane.roll = 0;
     plane.turnRate = (Math.random() - 0.5) * 0.4;
-    plane.targetHeading = Math.random() * Math.PI * 2;
     plane.headingChangeTimer = 0;
     plane.headingChangeInterval = 45 + Math.random() * 55;
     
     updatePlaneProperties(plane);
 }
 
-// Function to adjust size and speed based on Y-position (height)
+// Function to adjust size and speed based on height above ground
 function updatePlaneProperties(plane) {
-    const heightRatio = (plane.mesh.position.y - MIN_HEIGHT) / (MAX_HEIGHT - MIN_HEIGHT);
+    const agl = yToAGL(plane.mesh.position.y);
+    const heightRatio = (agl - MIN_HEIGHT_AGL) / (MAX_HEIGHT_AGL - MIN_HEIGHT_AGL);
 
     // Higher planes are faster; apply per-plane base speed multiplier for variation
     const baseSpeedFactor = plane.baseSpeed || 1;
-    plane.speed = (0.05 + heightRatio * 0.15) * baseSpeedFactor; 
+    plane.speed = (0.05 + heightRatio * 0.15) * baseSpeedFactor * DEBUG_PLANE_SPEED_MULT; 
 
     // Higher planes are scaled up (to appear larger due to being closer to the camera at higher viewing angles)
     // A more realistic approach would be to scale them *down* as they get farther away, but since the 
@@ -951,27 +1072,35 @@ function updatePlaneProperties(plane) {
 }
 
 // Function to handle the flashing navigation lights
-function flashNavigationLights(plane, time) {
+function flashNavigationLights(plane, time, lightMultiplier = 1.0) {
     const speed = plane.speed * 20; // Flashing is related to speed
+
+    // Calculate base intensities adjusted for time of day
+    // Lights are brighter at night (multiplier high) and dimmer during day (multiplier low)
+    const redGreenBase = DEBUG_LIGHTS ? 10 : 1.2; // 2x brighter (was 5 / 0.6)
+    const whiteBase = DEBUG_LIGHTS ? 14 : 3.2; // 2x brighter (was 7 / 1.6)
+    
+    const redGreenIntensity = redGreenBase * lightMultiplier;
+    const whiteIntensity = whiteBase * lightMultiplier;
 
     // Red/Green Flash (Alternating/Fast)
     if (Math.sin(time * speed) > 0.8) {
-    plane.redLight.intensity = DEBUG_LIGHTS ? 5 : 0.6;
+        plane.redLight.intensity = redGreenIntensity;
         plane.greenLight.intensity = 0;
-        if (plane.redMesh) plane.redMesh.material.opacity = 1;
+        if (plane.redMesh) plane.redMesh.material.opacity = lightMultiplier;
         if (plane.redMesh) plane.redMesh.scale.setScalar(DEBUG_LIGHTS ? 3.0 : 1.0);
         if (plane.greenMesh) plane.greenMesh.material.opacity = 0;
     } else if (Math.sin(time * speed) < -0.8) {
         plane.redLight.intensity = 0;
-    plane.greenLight.intensity = DEBUG_LIGHTS ? 5 : 0.6;
+        plane.greenLight.intensity = redGreenIntensity;
         if (plane.redMesh) plane.redMesh.material.opacity = 0;
-        if (plane.greenMesh) plane.greenMesh.material.opacity = 1;
+        if (plane.greenMesh) plane.greenMesh.material.opacity = lightMultiplier;
         if (plane.greenMesh) plane.greenMesh.scale.setScalar(DEBUG_LIGHTS ? 3.0 : 1.0);
     } else {
         plane.redLight.intensity = 0;
         plane.greenLight.intensity = 0;
-        if (plane.redMesh) plane.redMesh.material.opacity = DEBUG_LIGHTS ? 0.6 : 0;
-        if (plane.greenMesh) plane.greenMesh.material.opacity = DEBUG_LIGHTS ? 0.6 : 0;
+        if (plane.redMesh) plane.redMesh.material.opacity = DEBUG_LIGHTS ? 0.6 * lightMultiplier : 0;
+        if (plane.greenMesh) plane.greenMesh.material.opacity = DEBUG_LIGHTS ? 0.6 * lightMultiplier : 0;
     }
 
     // White Lights (Double-tap blink pattern: quick on, quick off, quick on, pause, repeat)
@@ -988,29 +1117,166 @@ function flashNavigationLights(plane, time) {
             const wl = plane.whiteLights[i];
             const wm = plane.whiteMeshes && plane.whiteMeshes[i];
             if (isWhiteOn) {
-                wl.intensity = DEBUG_LIGHTS ? 7 : 1.6;
+                wl.intensity = whiteIntensity;
                 if (wm) {
-                    wm.material.opacity = 1;
+                    wm.material.opacity = lightMultiplier;
                     wm.scale.setScalar(DEBUG_LIGHTS ? 3.5 : 1.0);
                 }
             } else {
                 wl.intensity = 0;
                 if (wm) {
-                    wm.material.opacity = DEBUG_LIGHTS ? 0.6 : 0;
+                    wm.material.opacity = DEBUG_LIGHTS ? 0.6 * lightMultiplier : 0;
                 }
             }
         }
     }
 }
 
+// Function to hide loading screen
+function hideLoadingScreen() {
+    if (loadingScreen) {
+        loadingScreen.classList.add('fade-out');
+        setTimeout(() => {
+            loadingScreen.style.display = 'none';
+        }, 800); // Match CSS transition time
+    }
+}
+
 // Initial plane generation
-// Initial plane generation (bias spawn positions near camera)
+if (DEBUG_CONSOLE) console.log(`🚀 Starting to create ${MAX_PLANES} planes...`);
 for (let i = 0; i < MAX_PLANES; i++) {
-    const spawnNear = Math.random() < SPAWN_NEAR_PROB;
     const center = (function(){ const p=new THREE.Vector3(); camera.getWorldPosition(p); return p; })();
-    createPlanePlaceholder(spawnNear, center).catch(err => {
-        console.error('Failed to create plane:', err);
+    createPlanePlaceholder(true, center).then(() => {
+        planesLoaded++;
+        if (DEBUG_CONSOLE) console.log(`✅ Plane ${i + 1}/${MAX_PLANES} created. Total: ${planes.length}`);
+        
+        // Hide loading screen once all planes are loaded
+        if (planesLoaded >= MAX_PLANES) {
+            setTimeout(() => {
+                hideLoadingScreen();
+                if (DEBUG_CONSOLE) console.log('🎉 All planes loaded, hiding loading screen');
+            }, 300); // Small delay for smoother transition
+        }
+    }).catch(err => {
+        console.error(`❌ Failed to create plane ${i + 1}:`, err);
+        planesLoaded++; // Count failed loads too
+        if (planesLoaded >= MAX_PLANES) {
+            hideLoadingScreen();
+        }
     });
+}
+if (DEBUG_CONSOLE) console.log(`📡 Plane creation initiated. Planes array length: ${planes.length}`);
+
+// --- Day/Night Cycle Update Function ---
+function updateDayNightCycle() {
+    // Calculate sun and moon positions based on time of day
+    // timeOfDay: 0 = midnight, 0.25 = sunrise, 0.5 = noon, 0.75 = sunset, 1.0 = midnight
+    
+    const celestialDistance = SKY_RADIUS * 0.85;
+    
+    // Sun angle: rises at 0.25, peaks at 0.5, sets at 0.75
+    // Map timeOfDay to sun angle: 0.25 -> -90°, 0.5 -> 0°, 0.75 -> 90°
+    const sunAngle = (timeOfDay - 0.5) * Math.PI * 2; // Full rotation
+    const sunY = Math.sin(sunAngle) * celestialDistance;
+    const sunZ = Math.cos(sunAngle) * celestialDistance;
+    
+    // Moon is opposite to the sun
+    const moonAngle = sunAngle + Math.PI;
+    const moonY = Math.sin(moonAngle) * celestialDistance;
+    const moonZ = Math.cos(moonAngle) * celestialDistance;
+    
+    // Update sun position and visibility
+    if (celestialObjects.sun) {
+        celestialObjects.sun.position.set(0, sunY, sunZ);
+        // Sun is visible during day AND above horizon
+        const sunVisible = (timeOfDay > 0.15 && timeOfDay < 0.85) && sunY > 0;
+        celestialObjects.sun.visible = sunVisible;
+        celestialObjects.sun.material.opacity = sunVisible ? 1.0 : 0.0;
+    }
+    
+    // Update moon position and visibility
+    if (celestialObjects.moon) {
+        celestialObjects.moon.position.set(0, moonY, moonZ);
+        // Moon is visible during night AND above horizon
+        const moonVisible = (timeOfDay < 0.15 || timeOfDay > 0.85) && moonY > 0;
+        celestialObjects.moon.visible = moonVisible;
+        celestialObjects.moon.material.opacity = moonVisible ? 1.0 : 0.0;
+    }
+    
+    // Update sun light
+    if (celestialObjects.sunLight) {
+        celestialObjects.sunLight.position.set(0, sunY, sunZ);
+        // Sun light intensity peaks at noon
+        const dayPhase = Math.max(0, Math.sin((timeOfDay - 0.25) * Math.PI * 2));
+        celestialObjects.sunLight.intensity = dayPhase * 1.5;
+    }
+    
+    // Update moon light
+    if (celestialObjects.moonLight) {
+        celestialObjects.moonLight.position.set(0, moonY, moonZ);
+        // Moon light is visible at night
+        const nightPhase = 1.0 - Math.max(0, Math.sin((timeOfDay - 0.25) * Math.PI * 2));
+        celestialObjects.moonLight.intensity = nightPhase * 0.3;
+    }
+    
+    // Update star visibility - fade out during day
+    const starOpacity = 1.0 - Math.max(0, Math.sin((timeOfDay - 0.25) * Math.PI * 2));
+    celestialObjects.stars.forEach(star => {
+        star.material.opacity = starOpacity * 0.9;
+    });
+    
+    // Update sky shader uniforms
+    skyMaterial.uniforms.timeOfDay.value = timeOfDay;
+    skyMaterial.uniforms.sunDirection.value.set(0, sunY, sunZ).normalize();
+    
+    // Update scene background color and fog based on time of day
+    const nightColor = new THREE.Color(0x02001A);
+    const dayColor = new THREE.Color(0x87CEEB);
+    const sunsetColor = new THREE.Color(0xFF6B35);
+    
+    // Fog colors match atmospheric conditions
+    const nightFogColor = new THREE.Color(0x0a0a20);
+    const dayFogColor = new THREE.Color(0xb0d4f1);
+    const sunsetFogColor = new THREE.Color(0xffa070);
+    
+    const dayFactor = Math.max(0, Math.sin((timeOfDay - 0.25) * Math.PI * 2));
+    const sunsetFactor = (Math.sin((timeOfDay - 0.2) * Math.PI * 4) + 1) * 0.5 * (1 - dayFactor);
+    
+    const currentColor = nightColor.clone().lerp(dayColor, dayFactor).lerp(sunsetColor, sunsetFactor * 0.3);
+    scene.background.copy(currentColor);
+    
+    // Update fog color to match atmospheric haze
+    const currentFogColor = nightFogColor.clone().lerp(dayFogColor, dayFactor).lerp(sunsetFogColor, sunsetFactor * 0.5);
+    scene.fog.color.copy(currentFogColor);
+    
+    // Update ambient light based on time of day
+    // Night: dim blue ambient, Day: bright white ambient, Sunset: warm orange ambient
+    const nightAmbientColor = new THREE.Color(0x202040);
+    const dayAmbientColor = new THREE.Color(0xffffff);
+    const sunsetAmbientColor = new THREE.Color(0xffaa77);
+    
+    const currentAmbientColor = nightAmbientColor.clone().lerp(dayAmbientColor, dayFactor).lerp(sunsetAmbientColor, sunsetFactor * 0.6);
+    ambientLight.color.copy(currentAmbientColor);
+    
+    // Ambient intensity: low at night (0.3), high during day (1.2)
+    ambientLight.intensity = 0.3 + (dayFactor * 0.9);
+}
+
+// --- Wind System Update ---
+function updateWind(dt) {
+    windChangeTimer += dt;
+    
+    // Gradually change wind direction and strength
+    if (windChangeTimer > WIND_CHANGE_INTERVAL) {
+        windChangeTimer = 0;
+        // New wind direction (gradual shift, not complete reversal)
+        windDirection += (Math.random() - 0.5) * Math.PI * 0.5; // ±45 degree shift
+        windStrength = 0.5 + Math.random() * 1.5; // 0.5-2.0
+        
+        if (DEBUG_CONSOLE) {
+            console.log(`💨 Wind changed: ${(windDirection * 180 / Math.PI).toFixed(0)}° @ ${windStrength.toFixed(1)} strength`);
+        }
+    }
 }
 
 // --- Animation Loop ---
@@ -1018,8 +1284,15 @@ function animate(time) {
     requestAnimationFrame(animate);
     const dt = 1 / 60; // Assuming 60fps for simple physics/timing
 
+    // --- Day/Night Cycle Update ---
+    timeOfDay = (timeOfDay + DAY_CYCLE_SPEED * dt) % 1.0;
+    updateDayNightCycle();
+    
+    // --- Wind System Update ---
+    updateWind(dt);
+
     // --- Camera WASD movement (move the entire yawObject so camera moves with view direction) ---
-    const moveSpeed = movement.speed * dt; // units per frame based on speed (units/sec)
+    const moveSpeed = movement.speed * DEBUG_CAMERA_SPEED_MULT * dt; // Apply debug speed multiplier
     if (movement.forward || movement.backward || movement.left || movement.right || movement.up || movement.down) {
         // Get the forward direction from the yawObject (local Z direction after yaw rotation)
         const forward = new THREE.Vector3(0, 0, -1);
@@ -1059,176 +1332,268 @@ function animate(time) {
     if (skyMesh) skyMesh.position.copy(camWorldPos);
     if (skyObjects) skyObjects.position.copy(camWorldPos);
 
+    // Stream terrain chunks as you move across chunk boundaries
+    if (terrainChunks) terrainChunks.update(yawObject.position);
+
     // Prepare frustum once per frame for culling
     camera.updateMatrixWorld();
     const frustum = new THREE.Frustum();
     const projScreenMatrix = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     frustum.setFromProjectionMatrix(projScreenMatrix);
 
+    // Find nearest plane for debug HUD
+    let nearestPlane = null;
+    let nearestDist = Infinity;
+    if (DEBUG_HUD) {
+        if (planes.length === 0) {
+            if (debugHUD) {
+                debugHUD.innerHTML = `
+<b>⚠️  NO PLANES LOADED</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Waiting for planes to spawn...
+Check console for errors.
+                `.trim();
+            }
+        } else {
+            planes.forEach(p => {
+                const dist = camWorldPos.distanceTo(p.mesh.position);
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    nearestPlane = p;
+                }
+            });
+        }
+    }
+
     planes.forEach(plane => {
         // Frustum culling: skip rendering planes outside camera view (but still update physics)
         const planeBox = new THREE.Box3().setFromObject(plane.mesh);
         plane.mesh.visible = frustum.intersectsBox(planeBox);
         
-        // Vertical movement and altitude management
-        const altitude = plane.mesh.position.y;
+        // Vertical movement and altitude management (using AGL for clarity)
+        const altitude = yToAGL(plane.mesh.position.y); // Height above ground level
         const maxClimbRate = plane.maxClimbRate || 1.2;
         const maxDescentRate = plane.maxDescentRate || 0.8;
         const climbPerformance = plane.climbPerformance || 1;
-        const minCruiseAltitude = plane.minCruiseAltitude
-            ? Math.min(plane.minCruiseAltitude, MAX_HEIGHT - 60)
-            : MIN_HEIGHT + 75;
-        const altitudeCeiling = plane.altitudeCeiling || Math.min(MAX_HEIGHT - 25, minCruiseAltitude + 180);
 
-        // Initialize target altitude if not set
-        if (!plane.targetAltitude) {
-            plane.targetAltitude = Math.min(altitudeCeiling - 5, Math.max(minCruiseAltitude + 10, altitude + 25));
+        // Initialize waypoint if not set
+        if (!plane.waypoint) {
+            plane.waypoint = generateWaypoint(plane.mesh.position);
         }
 
-        // Update target altitude periodically
-        plane.altitudeTimer = (plane.altitudeTimer || 0) + dt;
-        if (plane.altitudeTimer > (plane.altitudeInterval || 20)) {
-            plane.altitudeTimer = 0;
-            plane.altitudeInterval = 18 + Math.random() * 28;
-            const newTarget = THREE.MathUtils.clamp(
-                minCruiseAltitude + Math.random() * (altitudeCeiling - minCruiseAltitude),
-                minCruiseAltitude + 10,
-                altitudeCeiling
-            );
-            plane.targetAltitude = newTarget;
+        // Update waypoint periodically (wander to new locations)
+        plane.waypointTimer = (plane.waypointTimer || 0) + dt;
+        if (plane.waypointTimer > (plane.waypointInterval || 30)) {
+            plane.waypointTimer = 0;
+            plane.waypointInterval = 30 + Math.random() * 40; // 30-70 seconds
+            plane.waypoint = generateWaypoint(plane.mesh.position);
+            if (DEBUG_CONSOLE) {
+                console.log(`🎯 New waypoint: (${plane.waypoint.x.toFixed(0)}, ${plane.waypoint.y.toFixed(0)}, ${plane.waypoint.z.toFixed(0)})`);
+            }
         }
 
-        // Ensure target altitude stays within valid bounds (no contradictions)
-        plane.targetAltitude = THREE.MathUtils.clamp(plane.targetAltitude, minCruiseAltitude + 5, altitudeCeiling - 5);
-
-        const altitudeError = plane.targetAltitude - altitude;
-        
-        // Calculate bounding box to find the actual lowest point of the aircraft geometry
-        const bbox = new THREE.Box3().setFromObject(plane.mesh);
-        const lowestPointY = bbox.min.y;
-        
-        // --- Sophisticated Altitude Management ---
-        // Calculate proximity to floor and ceiling (0..1, where 1 = at limit)
-    const floorBuffer = MIN_HEIGHT + FLOOR_BUFFER;
-        const floorProximity = THREE.MathUtils.clamp(
-            1 - (lowestPointY - MIN_HEIGHT) / (floorBuffer - MIN_HEIGHT),
-            0, 1
-        );
-        const ceilingProximity = THREE.MathUtils.clamp(
-            1 - (altitudeCeiling - altitude) / (altitudeCeiling - minCruiseAltitude),
-            0, 1
-        );
-        
-        // Calculate descent/ascent angle from current vertical speed
-        const horizontalSpeed = plane.speed || 0.1;
-        const descentAngle = Math.atan2(plane.vSpeed || 0, horizontalSpeed);
-        
-        // Base desired climb from altitude error
-        let baseDesiredClimb = altitudeError * 0.06 * climbPerformance;
-        
-        // Adjust climb rate based on proximity to limits
-        let adjustedDesiredClimb = baseDesiredClimb;
-        
-        // Near floor: smoothly raise the minimum allowed climb and add a gentle recovery boost
-        if (floorProximity > 0) {
-            const floorBlend = Math.pow(floorProximity, 1.6);
-            const minAllowedClimb = THREE.MathUtils.lerp(-maxDescentRate, maxClimbRate * 0.45, floorBlend);
-            adjustedDesiredClimb = Math.max(adjustedDesiredClimb, minAllowedClimb);
-            adjustedDesiredClimb += floorBlend * floorBlend * maxClimbRate * 0.3;
+        // --- Waypoint Navigation: 3D target-seeking with CURVED path interpolation ---
+        // Initialize waypoint system if needed
+        if (!plane.smoothWaypoint) {
+            plane.smoothWaypoint = plane.waypoint.clone();
+            plane.targetWaypoint = plane.waypoint.clone(); // The "next" waypoint we're blending toward
+            plane.waypointBlendFactor = 1.0; // 0 = old waypoint, 1 = fully at target waypoint
+            plane.waypointControlPoint = null; // Control point for curved path
         }
         
-        // Near ceiling: gradually limit climb rate instead of a hard cutoff
-        if (ceilingProximity > 0) {
-            const ceilingBlend = Math.pow(ceilingProximity, 1.6);
-            const maxAllowedClimb = THREE.MathUtils.lerp(maxClimbRate, -maxDescentRate * 0.4, ceilingBlend);
-            adjustedDesiredClimb = Math.min(adjustedDesiredClimb, maxAllowedClimb);
+        // Calculate vector to current smooth waypoint (what we're navigating to right now)
+        const toWaypoint = new THREE.Vector3().subVectors(plane.smoothWaypoint, plane.mesh.position);
+        const waypointDistance = toWaypoint.length();
+        
+        // If we're close to the smooth waypoint, generate a new target and start blending
+        if (waypointDistance < 200 && plane.waypointBlendFactor >= 0.99) {
+            const newWaypoint = generateWaypoint(plane.mesh.position);
+            
+            // Start a smooth blend from current smoothWaypoint to new target
+            plane.waypoint.copy(plane.smoothWaypoint); // Old waypoint = where we are now
+            plane.targetWaypoint = newWaypoint; // New target
+            plane.waypointBlendFactor = 0.0; // Start blending from 0 to 1
+            
+            // Generate a control point for a curved path (not direct route)
+            // Create a point offset perpendicular to the direct path
+            const directPath = new THREE.Vector3().subVectors(newWaypoint, plane.smoothWaypoint);
+            const pathDistance = directPath.length();
+            
+            // Create a perpendicular vector for the curve offset
+            const perpendicular = new THREE.Vector3(-directPath.z, 0, directPath.x).normalize();
+            
+            // Randomly curve left or right with varying intensity
+            const curveDirection = Math.random() < 0.5 ? 1 : -1;
+            const curveIntensity = 0.3 + Math.random() * 0.4; // 30-70% offset from direct path
+            
+            // Control point is at midpoint plus perpendicular offset
+            const midpoint = new THREE.Vector3().addVectors(plane.smoothWaypoint, directPath.multiplyScalar(0.5));
+            plane.waypointControlPoint = midpoint.add(perpendicular.multiplyScalar(pathDistance * curveIntensity * curveDirection));
+            
+            // Keep control point altitude in safe zone
+            const controlAltitude = yToAGL(plane.waypointControlPoint.y);
+            if (controlAltitude < SAFE_ZONE_MIN) {
+                plane.waypointControlPoint.y = aglToY(SAFE_ZONE_MIN + 50);
+            } else if (controlAltitude > SAFE_ZONE_MAX) {
+                plane.waypointControlPoint.y = aglToY(SAFE_ZONE_MAX - 50);
+            }
+            
+            if (DEBUG_CONSOLE) console.log(`✅ New curved path: curve ${curveDirection > 0 ? 'right' : 'left'}, intensity ${(curveIntensity * 100).toFixed(0)}%`);
         }
         
-        // Clamp to plane's performance limits
-        let desiredClimb = THREE.MathUtils.clamp(
-            adjustedDesiredClimb,
-            -maxDescentRate,
-            maxClimbRate
-        );
+        // Gradually blend using quadratic Bezier curve (old -> control -> target)
+        if (plane.waypointBlendFactor < 1.0) {
+            // Use ease-out cubic interpolation for ultra-smooth transitions
+            plane.waypointBlendFactor += 0.003; // Very slow blend rate for maximum smoothness
+            plane.waypointBlendFactor = Math.min(1.0, plane.waypointBlendFactor);
+            
+            // Ease-out cubic: starts fast, ends slow
+            const t = plane.waypointBlendFactor;
+            const eased = 1 - Math.pow(1 - t, 3);
+            
+            // Quadratic Bezier curve: B(t) = (1-t)²P0 + 2(1-t)t*P1 + t²P2
+            // P0 = old waypoint, P1 = control point, P2 = target waypoint
+            const oneMinusT = 1 - eased;
+            const bezier = new THREE.Vector3();
+            
+            bezier.addScaledVector(plane.waypoint, oneMinusT * oneMinusT);
+            bezier.addScaledVector(plane.waypointControlPoint, 2 * oneMinusT * eased);
+            bezier.addScaledVector(plane.targetWaypoint, eased * eased);
+            
+            plane.smoothWaypoint.copy(bezier);
+        }
         
-        const desiredClimbSmooth = plane.desiredClimbSmooth !== undefined
-            ? THREE.MathUtils.lerp(plane.desiredClimbSmooth, desiredClimb, 0.2)
-            : desiredClimb;
-        plane.desiredClimbSmooth = desiredClimbSmooth;
+        // Calculate distances to floor and ceiling reference points
+        const floorDist = altitude - MIN_HEIGHT_AGL;
+        const ceilingDist = MAX_HEIGHT_AGL - altitude;
+        const safeZoneMid = SAFE_ZONE_MIN + (SAFE_ZONE_MAX - SAFE_ZONE_MIN) * 0.5;
         
+        // Ensure smooth waypoint altitude stays in safe zone (adjust if needed)
+        const smoothWaypointAltitude = yToAGL(plane.smoothWaypoint.y);
+        if (smoothWaypointAltitude < SAFE_ZONE_MIN) {
+            plane.smoothWaypoint.y = aglToY(SAFE_ZONE_MIN + 20);
+        } else if (smoothWaypointAltitude > SAFE_ZONE_MAX) {
+            plane.smoothWaypoint.y = aglToY(SAFE_ZONE_MAX - 20);
+        }
+        
+        // Calculate desired vertical speed toward SMOOTH waypoint (not abrupt waypoint)
+        const altitudeError = yToAGL(plane.smoothWaypoint.y) - altitude;
+        let desiredClimb = altitudeError * 0.06 * climbPerformance; // Even gentler proportional control
+        
+        // Danger zone avoidance (wide 150m zones) - override waypoint if needed
+        if (floorDist < FLOOR_AVOIDANCE_DIST) {
+            const urgency = 1.0 - (floorDist / FLOOR_AVOIDANCE_DIST);
+            const avoidancePush = maxClimbRate * urgency * 0.6;
+            desiredClimb += avoidancePush;
+            
+            // If in deep danger, move waypoint to upper safe zone
+            if (floorDist < FLOOR_AVOIDANCE_DIST * 0.5 && waypointAltitude < safeZoneMid) {
+                plane.waypoint.y = aglToY(safeZoneMid + Math.random() * (SAFE_ZONE_MAX - safeZoneMid));
+                if (DEBUG_CONSOLE) console.log(`⚠️ FLOOR DANGER (${altitude.toFixed(0)}m): Waypoint moved up`);
+            }
+        }
+        else if (ceilingDist < CEILING_AVOIDANCE_DIST) {
+            const urgency = 1.0 - (ceilingDist / CEILING_AVOIDANCE_DIST);
+            const avoidancePush = maxDescentRate * urgency * 0.6;
+            desiredClimb -= avoidancePush;
+            
+            // If in deep danger, move waypoint to lower safe zone
+            if (ceilingDist < CEILING_AVOIDANCE_DIST * 0.5 && waypointAltitude > safeZoneMid) {
+                plane.waypoint.y = aglToY(SAFE_ZONE_MIN + Math.random() * (safeZoneMid - SAFE_ZONE_MIN));
+                if (DEBUG_CONSOLE) console.log(`⚠️ CEILING DANGER (${altitude.toFixed(0)}m): Waypoint moved down`);
+            }
+        }
+        
+        // Calculate horizontal heading toward SMOOTH waypoint for ultra-smooth turns
+        const dx = plane.smoothWaypoint.x - plane.mesh.position.x;
+        const dz = plane.smoothWaypoint.z - plane.mesh.position.z;
+        plane.targetHeading = Math.atan2(dx, dz);
+        
+        // STEP 4: Clamp to plane performance limits
+        desiredClimb = THREE.MathUtils.clamp(desiredClimb, -maxDescentRate, maxClimbRate);
+        
+        // STEP 5: Apply smoothly with lerp
+        plane.vSpeed = THREE.MathUtils.lerp(plane.vSpeed || 0, desiredClimb, 0.2);
+        
+        // Store for debugging
         plane.altitudeError = altitudeError;
-        plane.lastDesiredClimb = desiredClimbSmooth;
-        plane.floorProximity = floorProximity;
-        plane.ceilingProximity = ceilingProximity;
-        plane.descentAngle = descentAngle;
-
-        plane.vSpeed = THREE.MathUtils.lerp(plane.vSpeed || 0, desiredClimbSmooth, 0.08);
+        plane.lastDesiredClimb = desiredClimb;
+        plane.floorDist = floorDist;
+        plane.ceilingDist = ceilingDist;
+        plane.inDangerZone = (floorDist < FLOOR_AVOIDANCE_DIST || ceilingDist < CEILING_AVOIDANCE_DIST);
 
         plane.mesh.position.y += plane.vSpeed * dt;
 
-        if (plane.mesh.position.y > altitudeCeiling) {
-            plane.mesh.position.y = altitudeCeiling;
-            plane.vSpeed = Math.min(plane.vSpeed, 0);
-            plane.targetAltitude = Math.max(minCruiseAltitude + 20, altitudeCeiling - 15);
-        } else if (plane.mesh.position.y < MIN_HEIGHT + FLOOR_CLAMP_OFFSET) {
-            plane.mesh.position.y = MIN_HEIGHT + FLOOR_CLAMP_OFFSET;
-            const climbKick = maxClimbRate * 0.35;
-            plane.vSpeed = Math.max(plane.vSpeed, climbKick); // Prevent downward motion at floor
-            plane.desiredClimbSmooth = Math.max(plane.desiredClimbSmooth || 0, climbKick);
-            plane.targetAltitude = Math.max(
-                plane.targetAltitude || (MIN_HEIGHT + FLOOR_BUFFER + 30),
-                MIN_HEIGHT + FLOOR_BUFFER + 30,
-                minCruiseAltitude + 20
-            );
-        }
+        // No hard caps - let target-seeking and danger zones handle everything naturally
         // Update properties after vertical change
         updatePlaneProperties(plane);
 
         // --- Realistic Plane Physics ---
-        // Heading change: set target heading less frequently (every 20-60 seconds) for purposeful flight
-        plane.headingChangeTimer += dt;
-        if (plane.headingChangeTimer > plane.headingChangeInterval) {
-            // Small random deviation from current heading for wind-like behavior
-            const deviation = (Math.random() - 0.5) * 0.35; // ±20 degrees max
-            plane.targetHeading = plane.heading + deviation;
-            plane.headingChangeInterval = 45 + Math.random() * 55; // next change in 45-100 seconds
-            plane.headingChangeTimer = 0;
-        }
-
-        // Smooth heading change: interpolate towards target
+        // Heading is now determined by waypoint (calculated above)
+        
+        // Smooth heading change: interpolate towards target with weighted momentum
         let headingDiff = plane.targetHeading - plane.heading;
         // Wrap difference to [-π, π]
         while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
         while (headingDiff < -Math.PI) headingDiff += Math.PI * 2;
         
-        // Gradually turn towards target - much slower and more graceful
-        const headingChangeRate = 0.18; // radians per second (slower, sweeping turns)
-        const maxTurnThisFrame = headingChangeRate * dt;
-        plane.heading += Math.max(-maxTurnThisFrame, Math.min(maxTurnThisFrame, headingDiff * 0.12));
-
-        // Banking/roll effect: bank into turns (roll angle follows heading change rate)
-    const targetRoll = THREE.MathUtils.clamp(-headingDiff * 0.6, -Math.PI / 5, Math.PI / 5);
-        plane.roll += (targetRoll - plane.roll) * 0.03; // slower, more graceful roll response
-        plane.roll = Math.max(-Math.PI / 4, Math.min(Math.PI / 4, plane.roll)); // clamp roll to ±45°
-
-        // Dynamic pitch: respond to climb/descent physics with smooth transitions
-        const desiredClimbRate = plane.lastDesiredClimb !== undefined ? plane.lastDesiredClimb : (plane.vSpeed || 0);
-        const climbRateDiff = (plane.vSpeed || 0) - desiredClimbRate;
+        // Weighted yaw adjustment with momentum (dramatic changes over long periods)
+        if (!plane.yawVelocity) plane.yawVelocity = 0;
         
-        // Pitch influenced by: desired climb rate (primary), climb error (secondary), altitude error (tertiary)
-        // All influences are damped for smooth, gradual changes
+        // Much more gradual acceleration for dramatic turns
+        const yawAcceleration = headingDiff * 0.02; // Reduced from 0.06 - slower response to heading changes
+        plane.yawVelocity += yawAcceleration;
+        plane.yawVelocity *= 0.97; // Increased damping from 0.94 - maintains momentum longer
+        
+        // Limit yaw change rate for ultra-smooth turning
+        const maxYawChange = 0.006; // Reduced from 0.012 - slower maximum turn rate
+        plane.yawVelocity = THREE.MathUtils.clamp(plane.yawVelocity, -maxYawChange, maxYawChange);
+        
+        plane.heading += plane.yawVelocity;
+
+        // Banking/roll effect: bank proportionally into turns based on yaw velocity
+        // More dramatic roll for dramatic yaw changes, responding over time
+        const targetRoll = THREE.MathUtils.clamp(-plane.yawVelocity * 40, -Math.PI / 4, Math.PI / 4); // Increased multiplier from 25 to 40
+        
+        // Smooth roll transition - takes time to bank into and out of turns
+        if (!plane.rollVelocity) plane.rollVelocity = 0;
+        const rollError = targetRoll - plane.roll;
+        const rollAcceleration = rollError * 0.015; // Gradual roll acceleration
+        plane.rollVelocity += rollAcceleration;
+        plane.rollVelocity *= 0.93; // Damping for smooth roll
+        
+        // Limit roll change rate
+        const maxRollChange = 0.008;
+        plane.rollVelocity = THREE.MathUtils.clamp(plane.rollVelocity, -maxRollChange, maxRollChange);
+        
+        plane.roll += plane.rollVelocity;
+        plane.roll = Math.max(-Math.PI / 3.5, Math.min(Math.PI / 3.5, plane.roll)); // clamp roll to ±51° (more dramatic)
+
+        // Dynamic pitch: respond to vertical speed in a simple, realistic way
+        // Pitch angle should reflect the climb/descent rate
+        // Note: In Three.js, rotation.x is NEGATIVE for nose up, POSITIVE for nose down
+        // Use gentler pitch angles - planes can climb/descend gradually over time
         const targetPitch = THREE.MathUtils.clamp(
-            desiredClimbRate * 0.4
-            - climbRateDiff * 0.15
-            + ((plane.altitudeError || 0) / 200) * 0.08
-            + ((plane.floorProximity || 0) * 0.12), // nose-up bias near the floor
-            -Math.PI / 5,
-            Math.PI / 5
+            -(plane.vSpeed || 0) * 0.25, // Even more reduced multiplier for very gentle pitch
+            -Math.PI / 12,  // Max climb: -15 degrees (nose up) - more realistic
+            Math.PI / 12    // Max dive: +15 degrees (nose down) - more realistic
         );
         
-        // Very smooth pitch transition: 0.035 ensures gradual changes even with large target differences
-        plane.pitch = THREE.MathUtils.lerp(plane.pitch, targetPitch, 0.035);
-        plane.pitch = Math.max(-Math.PI / 4, Math.min(Math.PI / 4, plane.pitch)); // clamp pitch to ±45°
+        // Very smooth, weighted gradual pitch changes
+        // Use momentum-based smoothing - pitch changes slowly with weight
+        if (!plane.pitchVelocity) plane.pitchVelocity = 0;
+        
+        const pitchError = targetPitch - plane.pitch;
+        const pitchAcceleration = pitchError * 0.008; // Even more gentle acceleration (was 0.015)
+        plane.pitchVelocity += pitchAcceleration;
+        plane.pitchVelocity *= 0.95; // Increased damping for more gradual changes (was 0.92)
+        
+        // Limit pitch change rate for ultra-smooth transitions
+        const maxPitchChange = 0.005; // Reduced max change for smoother transitions (was 0.008)
+        plane.pitchVelocity = THREE.MathUtils.clamp(plane.pitchVelocity, -maxPitchChange, maxPitchChange);
+        
+        plane.pitch += plane.pitchVelocity;
+        plane.pitch = Math.max(-Math.PI / 9, Math.min(Math.PI / 9, plane.pitch)); // safety clamp to ±20°
 
         // Update plane orientation (heading, pitch, roll)
         plane.mesh.rotation.order = 'YXZ'; // Euler order: yaw, pitch, roll
@@ -1238,6 +1603,46 @@ function animate(time) {
 
         // Move plane forward in its local Z direction (based on speed)
         plane.mesh.translateZ(plane.speed);
+        
+        // --- Apply Wind Effects ---
+        // 1. Global wind drift (constant push in wind direction)
+        const windPushX = Math.cos(windDirection) * windStrength * dt * 0.3;
+        const windPushZ = Math.sin(windDirection) * windStrength * dt * 0.3;
+        plane.mesh.position.x += windPushX;
+        plane.mesh.position.z += windPushZ;
+        
+        // 2. Turbulence (random small movements for realism)
+        plane.turbulenceTimer += dt;
+        if (plane.turbulenceTimer > TURBULENCE_FREQUENCY) {
+            plane.turbulenceTimer = 0;
+            
+            // Generate random turbulence offset (increased strength)
+            const turbStrength = windStrength * 0.4; // Increased from 0.15 to 0.4
+            plane.turbulenceOffset.set(
+                (Math.random() - 0.5) * turbStrength,
+                (Math.random() - 0.5) * turbStrength * 0.6, // Increased vertical turbulence
+                (Math.random() - 0.5) * turbStrength
+            );
+        }
+        
+        // Apply turbulence with smooth interpolation
+        plane.mesh.position.x += plane.turbulenceOffset.x * dt * 3;
+        plane.mesh.position.y += plane.turbulenceOffset.y * dt * 3;
+        plane.mesh.position.z += plane.turbulenceOffset.z * dt * 3;
+        
+        // Enhanced roll wobble from turbulence (multiple frequencies for realism)
+        const turbulenceRoll = Math.sin(time * 0.5 + plane.lightTimer) * windStrength * 0.04 +
+                              Math.sin(time * 1.2 + plane.lightTimer * 0.7) * windStrength * 0.025;
+        plane.roll += turbulenceRoll * dt;
+        
+        // Add pitch wobble from turbulence
+        const turbulencePitch = Math.sin(time * 0.8 + plane.lightTimer * 1.3) * windStrength * 0.02 +
+                               Math.sin(time * 1.5 + plane.lightTimer * 0.5) * windStrength * 0.015;
+        plane.pitch += turbulencePitch * dt;
+        
+        // Add subtle yaw wobble (wind buffeting)
+        const turbulenceYaw = Math.sin(time * 0.6 + plane.lightTimer * 0.9) * windStrength * 0.03;
+        plane.heading += turbulenceYaw * dt;
 
         // 2. Despawn/respawn: if plane is outside the despawn bounding box around the camera, respawn it
         const despawnHalf = DESPAWN_BOX_SIZE / 2;
@@ -1249,8 +1654,65 @@ function animate(time) {
 
         // 3. Navigation Lights Flashing
         plane.lightTimer += dt;
-        flashNavigationLights(plane, plane.lightTimer);
+        // Calculate light multiplier based on time of day
+        // Lights are brightest at night (1.0) and dimmest during day (0.2)
+        const dayPhase = Math.max(0, Math.sin((timeOfDay - 0.25) * Math.PI * 2));
+        const lightMultiplier = 1.0 - (dayPhase * 0.8); // Night: 1.0, Day: 0.2
+        flashNavigationLights(plane, plane.lightTimer, lightMultiplier);
     });
+
+    // Update debug HUD with nearest plane info
+    if (DEBUG_HUD && debugHUD && nearestPlane) {
+        const p = nearestPlane;
+        const altitude = yToAGL(p.mesh.position.y);
+        const floorDist = altitude - MIN_HEIGHT_AGL;
+        const ceilingDist = MAX_HEIGHT_AGL - altitude;
+        
+        // Determine flight zone
+        let zone = '✈️ SAFE ZONE';
+        let zoneColor = '#0f0'; // green
+        
+        if (altitude < SAFE_ZONE_MIN) {
+            zone = '⚠️ BELOW SAFE ZONE';
+            zoneColor = '#ff0';
+            if (floorDist < FLOOR_AVOIDANCE_DIST * 0.5) {
+                zone = '🚨 FLOOR DANGER';
+                zoneColor = '#f00';
+            }
+        } else if (altitude > SAFE_ZONE_MAX) {
+            zone = '⚠️ ABOVE SAFE ZONE';
+            zoneColor = '#ff0';
+            if (ceilingDist < CEILING_AVOIDANCE_DIST * 0.5) {
+                zone = '🚨 CEILING DANGER';
+                zoneColor = '#f00';
+            }
+        }
+        
+        debugHUD.style.color = zoneColor;
+        
+        const waypointDist = p.waypoint ? p.mesh.position.distanceTo(p.waypoint) : 0;
+        const waypointAlt = p.waypoint ? yToAGL(p.waypoint.y) : 0;
+        const smoothWaypointDist = p.smoothWaypoint ? p.mesh.position.distanceTo(p.smoothWaypoint) : 0;
+        const smoothWaypointAlt = p.smoothWaypoint ? yToAGL(p.smoothWaypoint.y) : 0;
+        
+        debugHUD.innerHTML = `
+<b>🛩️  NEAREST PLANE (${nearestDist.toFixed(0)}m away)</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>Zone:</b> ${zone}
+
+<b>Altitude:</b> ${altitude.toFixed(0)}m AGL
+<b>Target WP:</b> ${waypointDist.toFixed(0)}m @ ${waypointAlt.toFixed(0)}m
+<b>Smooth WP:</b> ${smoothWaypointDist.toFixed(0)}m @ ${smoothWaypointAlt.toFixed(0)}m (Δ ${(p.altitudeError || 0).toFixed(0)}m)
+<b>Safe Zone:</b> ${SAFE_ZONE_MIN}-${SAFE_ZONE_MAX}m
+
+<b>Floor:</b> ${floorDist.toFixed(0)}m ${floorDist < FLOOR_AVOIDANCE_DIST ? `⚠️ ${((1.0 - floorDist/FLOOR_AVOIDANCE_DIST)*100).toFixed(0)}%` : '✓'}
+<b>Ceiling:</b> ${ceilingDist.toFixed(0)}m ${ceilingDist < CEILING_AVOIDANCE_DIST ? `⚠️ ${((1.0 - ceilingDist/CEILING_AVOIDANCE_DIST)*100).toFixed(0)}%` : '✓'}
+
+<b>vSpeed:</b> ${(p.vSpeed || 0).toFixed(2)} m/s ${p.vSpeed > 0.5 ? '⬆️' : p.vSpeed < -0.5 ? '⬇️' : '→'}
+<b>Pitch:</b> ${((p.pitch || 0) * 180 / Math.PI).toFixed(1)}° | <b>Roll:</b> ${((p.roll || 0) * 180 / Math.PI).toFixed(1)}°
+<b>Speed:</b> ${(p.speed || 0).toFixed(1)} u/f | <b>Heading:</b> ${((p.heading || 0) * 180 / Math.PI).toFixed(0)}°
+        `.trim();
+    }
 
     renderer.render(scene, camera);
 }
