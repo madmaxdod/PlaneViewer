@@ -32,6 +32,7 @@ renderer.toneMappingExposure = 1.0;
 // Day/Night Cycle Configuration
 let timeOfDay = 0.25; // 0 = midnight, 0.25 = sunrise, 0.5 = noon, 0.75 = sunset, 1.0 = midnight
 const DAY_CYCLE_SPEED = 0.001; // How fast time progresses (0.01 = ~100 seconds per full cycle)
+let nightModeOnly = false; // When true, stays at night (timeOfDay = 0)
 
 // Atmospheric Haze/Fog Configuration
 const FOG_NEAR = 500;  // Distance where fog starts to appear
@@ -490,8 +491,24 @@ const movement = {
     speed: 20 // units per second (normal ground movement speed - slower for realism)
 };
 
+// UI update function for night mode toggle
+function updateNightModeUI() {
+    const btn = document.getElementById('night-mode-toggle');
+    if (btn) {
+        btn.classList.toggle('active', nightModeOnly);
+        btn.textContent = nightModeOnly ? '🌙 Night Mode: ON' : '🌙 Night Mode: OFF';
+    }
+}
+
 // Map keys to movement flags
 function onKeyDown(event) {
+    // Toggle night mode with 'N' key
+    if (event.key.toLowerCase() === 'n') {
+        nightModeOnly = !nightModeOnly;
+        updateNightModeUI();
+        event.preventDefault();
+        return;
+    }
     switch (event.code) {
         case 'KeyW': movement.forward = true; event.preventDefault(); break;
         case 'KeyS': movement.backward = true; event.preventDefault(); break;
@@ -516,6 +533,15 @@ function onKeyUp(event) {
 
 window.addEventListener('keydown', onKeyDown);
 window.addEventListener('keyup', onKeyUp);
+
+// --- Night Mode Button Handler ---
+const nightModeBtn = document.getElementById('night-mode-toggle');
+if (nightModeBtn) {
+    nightModeBtn.addEventListener('click', () => {
+        nightModeOnly = !nightModeOnly;
+        updateNightModeUI();
+    });
+}
 
 // --- Fullscreen Toggle ---
 const fsButton = document.createElement('button');
@@ -1285,7 +1311,11 @@ function animate(time) {
     const dt = 1 / 60; // Assuming 60fps for simple physics/timing
 
     // --- Day/Night Cycle Update ---
-    timeOfDay = (timeOfDay + DAY_CYCLE_SPEED * dt) % 1.0;
+    if (nightModeOnly) {
+        timeOfDay = 0; // Keep it at night
+    } else {
+        timeOfDay = (timeOfDay + DAY_CYCLE_SPEED * dt) % 1.0;
+    }
     updateDayNightCycle();
     
     // --- Wind System Update ---
